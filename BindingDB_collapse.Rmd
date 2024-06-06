@@ -1,0 +1,161 @@
+---
+title: "Collapsing bindingDB compound-gene relationships"
+output:
+  html_document:
+    theme: cosmo
+    highlight: pygments
+---
+
+```{r, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(scales)
+library(readr)
+
+options(stringsAsFactors=FALSE)
+```
+
+```{r}
+path <- '../data/BindingDB'
+# Read bindingdb and remove non-human interactions
+binding.db <- file.path(path, 'binding.tsv.gz') %>%
+  readr::read_tsv() %>%
+  dplyr::filter(organism == 'Homo sapiens') %>%
+  dplyr::filter(! is.na(affinity_nM)) %>%
+  dplyr::mutate(
+    source=plyr::mapvalues(source, c('Curated from the literature by BindingDB'), c('BindingDB'))
+  )
+
+# View a subset of the data.frame
+binding.db %>% dplyr::sample_n(200) %>% dplyr::select(-c(pubmed, doi)) %>% DT::datatable()
+```
+
+```{r}
+# Read the drugbank to bindingDB fuzzy mappings produced using UniChem
+# Restrict to compounds in drugbank
+joined.df <- '..s/data/DrugBank/mapping/bindingdb.tsv' %>%
+  readr::read_tsv() %>%
+  dplyr::inner_join(binding.db)
+```
+
+`r nrow(joined.df)` compound--protein binding measurements are extracted for humans when restricting to DrugBank-mapped compounds.
+
+```{r}
+geom.mean <- function(x) {
+  # Returns the geometric mean
+  exp(mean(log(x)))
+}
+
+ResolveAffinity <- function(df) {
+  # Preferentially selects the affinity measure. If multiple meansurements
+  # exist for the same compound-protein pair, the geometric mean is taken.
+  for (measure in c('Kd', 'Ki', 'IC50')) {
+    if (is.element(measure, df$measure)) {
+      measure.df <- df[df$measure == measure, ]
+      return.df <- data.frame(
+        measure = measure,
+        affinity_nM = round(geom.mean(measure.df$affinity_nM), 5),
+        n_measures = nrow(measure.df),
+        sources = paste(unique(na.omit(measure.df$source)), collapse=','),
+        pubmeds = paste(unique(na.omit(measure.df$pubmed)), collapse=','))
+      return(return.df) #problem: this doesn't loop through the rest if Kd is found
+    }
+  }
+}
+
+# Create a single affinity measure for each compound-protein pair
+collapse.df <- joined.df %>%
+  dplyr::group_by(drugbank_id, bindingdb_id, uniprot, entrez_gene) %>%
+  dplyr::do(ResolveAffinity(.)) %>%
+  dplyr::ungroup()
+
+collapse.df %>%
+  readr::write_tsv('../data/BindingDB/bindings-drugbank-collapsed.tsv')
+
+# View a subset of the data.frame
+collapse.df %>% dplyr::sample_n(200) %>% DT::datatable()
+```
+
+`r nrow(collapse.df)` compound--protein pairs were assayed.
+
+```{r}
+drugbank.df <- '../data/DrugBank/drugbank.tsv' %>%
+  readr::read_tsv() %>%
+  dplyr::mutate(drugbank_approved = as.integer(grepl('approved', groups))) %>%
+  dplyr::transmute(drugbank_id, drugbank_name = name, drugbank_approved)  
+
+entrez.df <- '../data/EntrezGene/genes-human.tsv' %>%
+  readr::read_tsv() %>%
+  dplyr::transmute(entrez_gene = GeneID, gene_symbol = Symbol)
+
+gene.df <- collapse.df %>%
+  dplyr::group_by(drugbank_id, entrez_gene) %>%
+  dplyr::summarize(
+    affinity_nM = min(affinity_nM),
+    n_pairs = n(),
+    sources = paste(unique(sources), collapse=','),
+    pubmeds = paste(unique(pubmeds), collapse=',')
+    ) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(drugbank.df) %>%
+  dplyr::left_join(entrez.df)
+
+gene.df %>%
+  readr::write_tsv('../data/BindingDB/bindings-drugbank-gene.tsv')
+
+# View bindings for approved drugs
+gene.df %>%
+  dplyr::filter(affinity_nM <= 1000) %>%
+  dplyr::filter(drugbank_approved == 1) %>%
+  dplyr::select(drugbank_name, gene_symbol, affinity_nM, n_pairs) %>%
+  DT::datatable()
+```
+
+`r nrow(gene.df)` drugbank--gene pairs have measured binding affinities.
+
+### Interaction retention based on affinity threshold
+
+```{r, fig.width=8}
+exp.range <- -5:11
+
+gene.df %>%
+  ggplot(aes(x = affinity_nM)) +
+  geom_histogram(alpha = 0.6) +
+  scale_x_log10(
+    breaks = scales::trans_breaks("log10", n=10, function(x) 10^x),
+    labels = scales::trans_format("log10", math_format(10^.x))) +
+  theme_bw()
+
+gene.df %>%
+  ggplot(aes(x = affinity_nM)) +
+  stat_ecdf() +
+  scale_x_log10(
+    breaks = scales::trans_breaks("log10", n=10, function(x) 10^x),
+    labels = scales::trans_format("log10", math_format(10^.x))) +
+  theme_bw()
+```
+
+### Interactions per compound and per gene when restricting to micromolar or stronger affinities.
+
+```{r, fig.width=8}
+gene.df %>%
+  dplyr::filter(affinity_nM <= 1000) %>%
+  dplyr::group_by(drugbank_id) %>%
+  dplyr::summarize(n_genes = n()) %>%
+  ggplot(aes(x=n_genes)) +
+  geom_histogram(alpha=0.6) +
+  scale_x_log10(breaks=c(1:3, 5, 10, 20, 50, 100)) +
+  xlab('Genes bound per compound') +
+  theme_bw()
+
+gene.df %>%
+  dplyr::filter(affinity_nM <= 1000) %>%
+  dplyr::group_by(entrez_gene) %>%
+  dplyr::summarize(n_compounds = n()) %>%
+  ggplot(aes(x=n_compounds)) +
+  geom_histogram(alpha=0.6) +
+  scale_x_log10(breaks=c(1:5, 7, 10, 15, 25, 50)) +
+  xlab('Compounds binding per gene') +
+  theme_bw()
+```
